@@ -78,7 +78,11 @@ sayHello......
   这样，就可以实现前后拦截，同时可以根据需要，对拦截对象的参数做修改。
 
 ```java
-public class MyProxy2 {
+import java.lang.reflect.InvocationHandler;
+import java.lang.reflect.Method;
+import java.lang.reflect.Proxy;
+
+public class MyProxy {
     /**
      * 一个接口
      */
@@ -194,7 +198,7 @@ import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
 
-public class MyProxy3 {
+public class MyProxy {
     /**
      * 一个接口
      */
@@ -324,7 +328,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 
-public class MyProxy4 {
+public class MyProxy {
     /**
      * 一个接口
      */
@@ -467,22 +471,179 @@ public class MyProxy4 {
 
 ## 原理
 
+Mybatis的拦截器实现机制，和上面的最后优化代码非常相似。
+
+它也有个代理类Plugin(类似上面的TargetProxy)，同样实现InvocationHandler接口。
+
+当我们调用四大接口（ParameterHandler、ResultSetHandler、StatementHandler、Executor）的对象时，会执行Plugin的invoke方法：
+
+```java
+  @Override
+  public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
+    try {
+      Set<Method> methods = signatureMap.get(method.getDeclaringClass());
+      if (methods != null && methods.contains(method)) {
+        return interceptor.intercept(new Invocation(target, method, args));
+      }
+      return method.invoke(target, args);
+    } catch (Exception e) {
+      throw ExceptionUtil.unwrapThrowable(e);
+    }
+  }
+```
+
+以上，达到了拦截目标方法的结果。
+
+以Executor为例，执行的流程：
+
+* Executor.方法 -> Plugin.invoke -> Interceptor.intercept -> Invocation.proceed -> Executor.方法.invoke
+
 ## 如何自定义拦截器
+
+### Interceptor接口
+
+```java
+package org.apache.ibatis.plugin;
+
+import java.util.Properties;
+
+/**
+ * @author Clinton Begin
+ */
+public interface Interceptor {
+	// Executor.方法 -> Plugin.invoke -> Interceptor.intercept -> Invocation.proceed -> Executor.方法.invoke
+  // 执行拦截
+	Object intercept(Invocation invocation) throws Throwable;
+	// 输入目标对象，返回代理对象
+  Object plugin(Object target);
+	// 在Mybatis配置文件中指定一些属性
+  void setProperties(Properties properties);
+
+}
+```
+
+### 自定义拦截器
+
+ExamplePlugIn和上面的TransactionInterceptor性质是一样的。
+
+```java
+@Intercepts({@Signature( type= Executor.class,  method = "update", args ={MappedStatement.class,Object.class})})
+public class ExamplePlugin implements Interceptor {
+	public Object intercept(Invocation invocation) throws Throwable {
+    System.out.println("------插入前置通知代码-------------");
+    Object result = invocation.process();
+    System.out.println("------插入后置处理代码-------------");
+    return result;
+  }
+  public Object plugin(Object target) {
+    return Plugin.wrap(target, this);
+  }
+  public void setProperties(Properties properties) {
+  }
+}
+```
+
+### mybatis-config.xml
+
+```xml
+<plugins>
+	<plugin interceptor="xxx">
+	<!-- * 表示对全部mapper做隔离 -->
+	<property name="mappers" value="XXMapper"/>
+	<property name="mode" value="auto"/>
+</plugin>
+```
+
+至此，自定义MyBatis插件流程大致就是这样了。
 
 ## Mybatis四大接口
 
+* Executor：Mybatis的执行器，用于执行CRUD操作。
+* ParameterHandler：处理SQL的参数对象。
+* ResultSetHandler：对象SQL的返回结果。
+* StatementHandler：负责处理Mybatis与JDBC之间Statement的交互。
 
+**下图描述Mybatis框架的执行过程**：
+
+  ```mermaid
+graph TD
+session[SqlSession 对外接口]==>executor[Executor 内部执行器]==>statement[StatementHandler JDBC封装层] ==>db((数据库))
+param["ParameterHandler 参数处理层"]==>statement
+db ==> result[ResultSetHandler 返回结果集]
+  ```
 
 # Mybatis Plugin 插件源码
 
-## 拦截器链InterceptorChain
+## Plugin类清单
+
+* Interceptor：拦截器接口。
+* InterceptorChain：拦截器职责链。
+* Intercepts：注解，和Signature一起，根据目标对象的type/method/args判断是否需要拦截。
+* Invocation：封装拦截目标对象。
+* Plugin：代理类，实现了InvocationHandler，就是我们上面实现的TargetProxy。
+* PluginException：自定义异常类。
+* Signature：注解，type/method/args
+
+这些代码和我们上面实现的非常相似，有兴趣直接找源码看就可以了。
 
 ## Configuration
 
-## Plugin
+Mybatis是通过初始化配置文件把所有的拦截器添加到拦截器链中。
 
-## Interceptor接口
+```java
+  public ParameterHandler newParameterHandler(MappedStatement mappedStatement, Object parameterObject, BoundSql boundSql) {
+    ParameterHandler parameterHandler = mappedStatement.getLang().createParameterHandler(mappedStatement, parameterObject, boundSql);
+    parameterHandler = (ParameterHandler) interceptorChain.pluginAll(parameterHandler);
+    return parameterHandler;
+  }
+
+  public ResultSetHandler newResultSetHandler(Executor executor, MappedStatement mappedStatement, RowBounds rowBounds, ParameterHandler parameterHandler,
+      ResultHandler resultHandler, BoundSql boundSql) {
+    ResultSetHandler resultSetHandler = new DefaultResultSetHandler(executor, mappedStatement, parameterHandler, resultHandler, boundSql, rowBounds);
+    resultSetHandler = (ResultSetHandler) interceptorChain.pluginAll(resultSetHandler);
+    return resultSetHandler;
+  }
+
+  public StatementHandler newStatementHandler(Executor executor, MappedStatement mappedStatement, Object parameterObject, RowBounds rowBounds, ResultHandler resultHandler, BoundSql boundSql) {
+    StatementHandler statementHandler = new RoutingStatementHandler(executor, mappedStatement, parameterObject, rowBounds, resultHandler, boundSql);
+    statementHandler = (StatementHandler) interceptorChain.pluginAll(statementHandler);
+    return statementHandler;
+  }
+
+  public Executor newExecutor(Transaction transaction) {
+    return newExecutor(transaction, defaultExecutorType);
+  }
+
+  public Executor newExecutor(Transaction transaction, ExecutorType executorType) {
+    executorType = executorType == null ? defaultExecutorType : executorType;
+    executorType = executorType == null ? ExecutorType.SIMPLE : executorType;
+    Executor executor;
+    if (ExecutorType.BATCH == executorType) {
+      executor = new BatchExecutor(this, transaction);
+    } else if (ExecutorType.REUSE == executorType) {
+      executor = new ReuseExecutor(this, transaction);
+    } else {
+      executor = new SimpleExecutor(this, transaction);
+    }
+    if (cacheEnabled) {
+      executor = new CachingExecutor(executor);
+    }
+    executor = (Executor) interceptorChain.pluginAll(executor);
+    return executor;
+  }
+```
 
 # 原文地址
 
 https://www.cnblogs.com/qdhxhz/p/11390778.html
+
+# 致谢
+
+**作者有这样一句话，蛮奋斗的：**
+
+ ```
+我相信，无论今后的道路多么坎坷，只要抓住今天，迟早会在奋斗中尝到人生的甘甜。抓住人生中的一分一秒，胜过虚度中的一月一年！
+ ```
+
+这篇博客，增强对JDK动态代理和责任链模式的理解，在代码设计上也很有启发。:thumbsup:
+
